@@ -20,6 +20,7 @@ import httpx
 
 from .config import OVERLEAF_BASE_URL
 from .credentials import get_session
+from .metadata import write_metadata
 
 logger = logging.getLogger("overleaf-mcp")
 
@@ -88,7 +89,14 @@ def list_projects_web() -> list[dict[str, str]]:
 
 
 def compile_project(project_id: str) -> dict:
-    """Trigger PDF compilation and return status + output file list."""
+    """Trigger PDF compilation and return status + output file list.
+
+    Also propagates ``clsi_server_id`` (and ``output_url_prefix`` /
+    ``pdf_download_domain``) from the compile response. Callers MUST
+    append ``?clsiserverid=<id>`` to each per-build output URL — without
+    it, the Overleaf CLSI CDN returns HTTP 404 (verified 2026-05).
+    See :func:`_build_output_url`.
+    """
     csrf = _csrf_token(project_id)
     r = httpx.post(
         f"{OVERLEAF_BASE_URL}/project/{project_id}/compile",
@@ -112,7 +120,27 @@ def compile_project(project_id: str) -> dict:
     return {
         "status": data.get("status"),
         "output_files": data.get("outputFiles", []),
+        # New (2026-05): required to build working per-build output URLs.
+        "clsi_server_id": data.get("clsiServerId"),
+        "output_url_prefix": data.get("outputUrlPrefix"),
+        "pdf_download_domain": data.get("pdfDownloadDomain"),
     }
+
+
+def _build_output_url(url: str, clsi_server_id: str | None) -> str:
+    """Turn a per-build output URL (absolute or site-relative) into a fully
+    qualified URL with the mandatory ``?clsiserverid=<id>`` query param.
+
+    As of 2026-05 the Overleaf CLSI CDN returns HTTP 404 on per-build
+    output URLs (``/project/<pid>/user/<uid>/build/<bid>/output/*``) when
+    called without the ``clsiserverid`` query — the id is returned by
+    ``/project/<pid>/compile`` as the top-level ``clsiServerId`` field.
+    """
+    full_url = url if url.startswith("http") else f"{OVERLEAF_BASE_URL}{url}"
+    if clsi_server_id and "clsiserverid=" not in full_url:
+        sep = "&" if "?" in full_url else "?"
+        full_url = f"{full_url}{sep}clsiserverid={clsi_server_id}"
+    return full_url
 
 
 def download_pdf(project_id: str, output_path: str) -> str:
@@ -120,6 +148,8 @@ def download_pdf(project_id: str, output_path: str) -> str:
 
     Uses the per-build output URL returned by compile_project, because the
     shortcut /project/<id>/output/output.pdf returns 404 on current Overleaf.
+    Also appends ``?clsiserverid=<id>`` (required by the CLSI CDN as of
+    2026-05).
     """
     compile_info = compile_project(project_id)
     pdf_url = None
@@ -128,11 +158,12 @@ def download_pdf(project_id: str, output_path: str) -> str:
             pdf_url = f["url"]
             break
     if not pdf_url:
+        _status = compile_info.get('status')
         raise RuntimeError(
-            f"No output.pdf in compile result (status={compile_info.get('status')}). "
+            f"No output.pdf in compile result (status={_status}). "
             "Check compile logs with download_log."
         )
-    full_url = pdf_url if pdf_url.startswith("http") else f"{OVERLEAF_BASE_URL}{pdf_url}"
+    full_url = _build_output_url(pdf_url, compile_info.get("clsi_server_id"))
     r = httpx.get(
         full_url,
         headers=_headers(),
@@ -217,6 +248,12 @@ def download_source(project_id: str, output_dir: str, overwrite: bool = False) -
             safe_members.append(m)
         zf.extractall(abs_dir, members=safe_members)
         n_entries = len(safe_members)
+    # Drop a sidecar that identifies the remote project — so any tool that
+    # later opens this directory can tell which Overleaf project it is.
+    try:
+        write_metadata(abs_dir, project_id, source="zip")
+    except Exception as e:
+        logger.debug("metadata write skipped after extract: %s", e)
     size_kb = len(r.content) / 1024
     return (
         f"Source extracted to {abs_dir} "

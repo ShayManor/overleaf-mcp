@@ -56,17 +56,22 @@ _PROJECT_ID_PROP = {
         "(e.g. '692a83fb82feceb233c4b0e7'), obtained from list_projects "
         "or the Overleaf project URL. "
         "NOT a local filesystem path, NOT '.', NOT a project name or title. "
-        "These tools operate on the REMOTE Overleaf repo; if you already have "
-        "the project downloaded locally, use read_files / grep_search instead. "
+        "These tools operate on the REMOTE Overleaf repo. "
+        "Only call these overleaf_* tools when the user explicitly asks to "
+        "work with an Overleaf project — never for general local file I/O. "
+        "If you already have a copy of THIS Overleaf project checked out on "
+        "the local filesystem, prefer the standard read_files / grep_search "
+        "tools against that local path. "
         "Always call list_projects first when unsure."
     ),
 }
 
-# ══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 # Tool definitions
-# ══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 
 _TOOLS: list[Tool] = [
+    # ── CREATE ────────────────────────────────────────────────────────────
     Tool(
         name="create_file",
         description=(
@@ -101,6 +106,7 @@ _TOOLS: list[Tool] = [
             "required": ["name"],
         },
     ),
+    # ── READ ──────────────────────────────────────────────────────────────
     Tool(
         name="list_projects",
         description=(
@@ -228,6 +234,7 @@ _TOOLS: list[Tool] = [
             "required": ["project_id"],
         },
     ),
+    # ── UPDATE ────────────────────────────────────────────────────────────
     Tool(
         name="edit_file",
         description=(
@@ -293,6 +300,42 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="upload_file",
+        description=(
+            "Upload a local (possibly BINARY) file into an Overleaf project. "
+            "Use this for images (PNG/JPG), PDFs, and other non-text assets "
+            "that must not be UTF-8 decoded. Commits and pushes immediately."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_PROP,
+                "file_path": {
+                    "type": "string",
+                    "description": "Destination path inside the project (e.g. 'figures/cat.png').",
+                },
+                "source_path": {
+                    "type": "string",
+                    "description": "Local filesystem path of the file to upload.",
+                },
+                "commit_message": {"type": "string", "description": "Git commit message"},
+                "overwrite": {
+                    # Accept boolean OR string ("true"/"1"/"yes"/etc.) because
+                    # LLM clients often emit JSON strings even when the schema
+                    # asks for a bool. _coerce_bool() normalises both forms.
+                    "type": ["boolean", "string"],
+                    "description": (
+                        "If true, replace an existing file at file_path. "
+                        "Default false. Accepts boolean or case-insensitive "
+                        "string ('true'/'false'/'1'/'0'/'yes'/'no')."
+                    ),
+                },
+            },
+            "required": ["project_id", "file_path", "source_path"],
+        },
+    ),
+    # ── DELETE ────────────────────────────────────────────────────────────
+    Tool(
         name="delete_file",
         description="Delete a file from the project. Commits and pushes immediately.",
         inputSchema={
@@ -305,6 +348,7 @@ _TOOLS: list[Tool] = [
             "required": ["project_id", "file_path"],
         },
     ),
+    # ── COMPILE / PDF ────────────────────────────────────────────────────
     Tool(
         name="compile_project",
         description=(
@@ -353,6 +397,7 @@ _TOOLS: list[Tool] = [
             "required": ["project_id"],
         },
     ),
+    # ── SOURCE DOWNLOAD ──────────────────────────────────────────────────
     Tool(
         name="download_source_zip",
         description=(
@@ -387,8 +432,12 @@ _TOOLS: list[Tool] = [
                     "description": "Local directory to extract the project source into.",
                 },
                 "overwrite": {
-                    "type": "boolean",
-                    "description": "If true, extract even if output_dir is non-empty. Default false.",
+                    "type": ["boolean", "string"],
+                    "description": (
+                        "If true, extract even if output_dir is non-empty. "
+                        "Default false. Accepts boolean or case-insensitive "
+                        "string ('true'/'false'/'1'/'0'/'yes'/'no')."
+                    ),
                 },
             },
             "required": ["project_id", "output_dir"],
@@ -396,6 +445,10 @@ _TOOLS: list[Tool] = [
     ),
 ]
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool dispatch
+# ═══════════════════════════════════════════════════════════════════════════
 
 _SERVER_INSTRUCTIONS = """\
 This server provides tools for the Overleaf LaTeX editor.
@@ -438,6 +491,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
+# Tools that only need a session cookie (not a git token)
 _COOKIE_ONLY_TOOLS = {
     "list_projects",
     "compile_project",
@@ -462,10 +516,48 @@ _MISSING_CREDENTIALS_HINT = (
 )
 
 
+_TRUTHY_STRINGS = {"true", "1", "yes", "y", "on"}
+_FALSY_STRINGS = {"false", "0", "no", "n", "off", ""}
+
+
+def _coerce_bool(value: Any, *, default: bool = False) -> bool:
+    """Normalise a JSON Schema boolean argument to a Python bool.
+
+    LLM clients (Claude, GPT, Gemini) routinely emit JSON strings like
+    ``"true"`` or ``"True"`` even when the tool schema declares ``boolean``.
+    The MCP framework's schema validator then rejects the call before
+    we can coerce. We work around this by declaring such fields as
+    ``["boolean", "string"]`` in the schema and routing every value
+    through this helper so the dispatch code can stay typed.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in _TRUTHY_STRINGS:
+            return True
+        if v in _FALSY_STRINGS:
+            return False
+    raise ValueError(
+        f"Cannot interpret {value!r} as a boolean — expected true/false "
+        "or one of 'true','false','1','0','yes','no'."
+    )
+
+
 def _auto_setup_guard(name: str) -> str | None:
+    """If a tool is called with no credentials, return a clear error listing
+    the missing environment variables instead of failing cryptically.
+
+    Returns None to pass through normally.
+    """
     has_session = bool(get_session())
     has_token = bool(get_git_token())
 
+    # Cookie-only tools: need just the session cookie
     if name in _COOKIE_ONLY_TOOLS:
         if has_session:
             return None
@@ -474,6 +566,7 @@ def _auto_setup_guard(name: str) -> str | None:
             "but it is not set.\n\n" + _MISSING_CREDENTIALS_HINT
         )
 
+    # Git-based tools: need both session and git token
     if has_session and has_token:
         return None
     missing = []
@@ -488,9 +581,14 @@ def _auto_setup_guard(name: str) -> str | None:
 
 
 async def _dispatch(name: str, args: dict[str, Any]) -> str:
+    """Route a tool call to the appropriate handler."""
+
+    # Short-circuit with a clear error if required credentials are missing
     guard = _auto_setup_guard(name)
     if guard is not None:
         return guard
+
+    # ── CREATE ────────────────────────────────────────────────────────────
 
     if name == "create_file":
         project = get_project(args["project_id"])
@@ -506,7 +604,24 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         if not _HAS_COMPILE:
             return "Error: compile extras required. pip install overleaf-mcp[compile]"
         result = await asyncio.to_thread(_compile_mod.create_project_web, args["name"])
-        return json.dumps(result, indent=2)
+        # Emit a human-readable confirmation that shows BOTH the natural
+        # name the user just typed AND the full 24-hex project_id that
+        # every other tool needs. Historically we dumped the bare JSON
+        # dict here, which made the UI show only "🔌 overleaf/create_project"
+        # with no clue *which* project was created — see chatui issue
+        # "improve overleaf-mcp UX" (2026-04-29).
+        pid = result.get("id", "?")
+        pname = result.get("name", args.get("name", "?"))
+        short = f"{pid[:5]}…{pid[-4:]}" if pid and len(pid) >= 10 else pid
+        return (
+            f"✅ Created Overleaf project [{pname}]\n"
+            f"   project_id: {pid}  (short: {short})\n"
+            f"   Open: https://www.overleaf.com/project/{pid}\n"
+            f"   Pass this project_id to other overleaf tools "
+            f"(create_file, edit_file, compile_project, …)."
+        )
+
+    # ── READ ──────────────────────────────────────────────────────────────
 
     if name == "list_projects":
         if not _HAS_COMPILE:
@@ -618,6 +733,8 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
     if name == "status_summary":
         project = get_project(args["project_id"])
 
+        # Resolve the project's natural (human) name via the web dashboard,
+        # since ProjectConfig.name is only a placeholder derived from the ID.
         natural_name: str | None = None
         if _HAS_COMPILE and get_session():
             try:
@@ -644,11 +761,15 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
             content = await asyncio.to_thread(git_client.read_file, project, main_file)
             sections = parse_sections(content)
             summary.append(f"\n📋 Structure of {main_file} ({len(sections)} sections):")
+            # Show every section in full — no truncation. Callers rely on
+            # status_summary for a complete bird's-eye view of the project.
             for i, s in enumerate(sections):
                 indent = "  " * s["level"]
                 summary.append(f"   {indent}{i + 1}. [{s['type']}] {s['title']}")
 
         return "\n".join(summary)
+
+    # ── UPDATE ────────────────────────────────────────────────────────────
 
     if name == "edit_file":
         project = get_project(args["project_id"])
@@ -690,6 +811,19 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         project = get_project(args["project_id"])
         return await asyncio.to_thread(git_client.sync_project, project)
 
+    if name == "upload_file":
+        project = get_project(args["project_id"])
+        return await asyncio.to_thread(
+            git_client.upload_file,
+            project,
+            args["file_path"],
+            args["source_path"],
+            args.get("commit_message"),
+            _coerce_bool(args.get("overwrite"), default=False),
+        )
+
+    # ── DELETE ────────────────────────────────────────────────────────────
+
     if name == "delete_file":
         project = get_project(args["project_id"])
         return await asyncio.to_thread(
@@ -698,6 +832,8 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
             args["file_path"],
             args.get("commit_message"),
         )
+
+    # ── COMPILE / PDF ────────────────────────────────────────────────────
 
     if name == "compile_project":
         if not _HAS_COMPILE:
@@ -716,7 +852,7 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         if not _HAS_COMPILE:
             return "Error: compile extras required. pip install overleaf-mcp[compile]"
         import httpx
-        from .compile import _headers, OVERLEAF_BASE_URL  # noqa: F811
+        from .compile import _headers, _build_output_url  # noqa: F811
 
         pid = args["project_id"]
         compile_result = await asyncio.to_thread(_compile_mod.compile_project, pid)
@@ -724,8 +860,12 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         log_file = next((f for f in output_files if f.get("path", "").endswith(".log")), None)
         if not log_file:
             return f"No .log file in compile output. Status: {compile_result.get('status')}"
+        # Use the per-build URL from compile_project output_files and append
+        # ?clsiserverid=<id> (required by the CLSI CDN as of 2026-05; without
+        # it every per-build URL returns HTTP 404). The legacy shortcut
+        # /project/<id>/output/output.log also returns 404 on current Overleaf.
         log_path = log_file.get("url") or f"/project/{pid}/output/{log_file['path']}"
-        log_url = log_path if log_path.startswith("http") else f"{OVERLEAF_BASE_URL}{log_path}"
+        log_url = _build_output_url(log_path, compile_result.get("clsi_server_id"))
         r = httpx.get(log_url, headers=_headers(), follow_redirects=True, timeout=30)
         r.raise_for_status()
         text = r.text
@@ -748,10 +888,15 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
             _compile_mod.download_source,
             args["project_id"],
             args["output_dir"],
-            bool(args.get("overwrite", False)),
+            _coerce_bool(args.get("overwrite"), default=False),
         )
 
     return f"Unknown tool: {name}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 def main() -> None:

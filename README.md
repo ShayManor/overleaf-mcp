@@ -78,12 +78,22 @@ AI:  [compile_project + download_pdf] PDF saved to ~/Desktop/thesis.pdf ✓
 
 ### Option 1: pip (recommended)
 
+The package is published on PyPI as **`overleaf-mcp-plus`** (the plain
+`overleaf-mcp` name was taken by an unrelated project). The CLI entry
+point is still `overleaf-mcp`.
+
 ```bash
 # Core (git-based tools only)
-pip install overleaf-mcp
+pip install overleaf-mcp-plus
 
-# With compile/download support
-pip install overleaf-mcp[compile]
+# With compile/download support (recommended)
+pip install "overleaf-mcp-plus[compile]"
+```
+
+Or run directly without installing, via `uvx`:
+
+```bash
+uvx --from "overleaf-mcp-plus[compile]" overleaf-mcp
 ```
 
 ### Option 2: From source
@@ -306,6 +316,27 @@ You can start with just the cookie and add the git token later.
 - `server.py` — MCP server with 18 tool definitions
 
 ---
+
+## 🪪 Local-copy metadata sidecar
+
+Whenever `download_source` extracts a project to a local directory, or
+`ensure_repo` clones one into the git cache, the server drops a small
+`.overleaf-project.json` file at the root of that copy:
+
+```json
+{
+  "project_id": "69e46cd469c0fc49d2627320",
+  "name": "[阿布] 毕业论文魔改版",
+  "overleaf_url": "https://www.overleaf.com/project/69e46cd469c0fc49d2627320",
+  "source": "zip",
+  "downloaded_at": "2026-04-22T10:54:55+00:00"
+}
+```
+
+This lets any tool (including an AI assistant) unambiguously identify
+which Overleaf project a local working directory corresponds to — no
+more guessing by file names. For git-backed copies the file is added to
+`.git/info/exclude` so it is never pushed back to Overleaf.
 
 ## 🔒 Security
 

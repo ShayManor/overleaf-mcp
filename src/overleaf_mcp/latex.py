@@ -16,10 +16,42 @@ SECTION_LEVELS = [
     "subparagraph",
 ]
 
+# Match the command + ``*`` marker + opening brace. The title that follows
+# can contain nested braces (e.g. ``\section{Foo \texttt{bar}}``) so we do
+# NOT use the naive ``\{([^}]+)\}`` pattern; instead we locate the opening
+# brace and walk the string to find its matching close.
 SECTION_PATTERN = re.compile(
-    r"\\(" + "|".join(SECTION_LEVELS) + r")\*?\{([^}]+)\}",
+    r"\\(" + "|".join(SECTION_LEVELS) + r")(\*?)\s*\{",
     re.MULTILINE,
 )
+
+
+def _extract_braced(content: str, open_idx: int) -> tuple[str, int] | None:
+    """Given ``content[open_idx] == '{'``, return (body, index_after_close).
+
+    Handles nested ``{}`` pairs, so ``\\section{Foo \\texttt{bar}}`` yields
+    ``Foo \\texttt{bar}``. Backslash-escaped braces are treated as literal.
+    Returns ``None`` if no matching close is found.
+    """
+    if open_idx >= len(content) or content[open_idx] != "{":
+        return None
+    depth = 1
+    i = open_idx + 1
+    n = len(content)
+    while i < n:
+        ch = content[i]
+        if ch == "\\" and i + 1 < n:
+            # Skip the escaped char (e.g. ``\{``, ``\}``)
+            i += 2
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return content[open_idx + 1 : i], i + 1
+        i += 1
+    return None
 
 
 def parse_sections(content: str) -> list[dict[str, Any]]:
@@ -29,14 +61,21 @@ def parse_sections(content: str) -> list[dict[str, Any]]:
       type, title, preview, start_pos, end_pos, level
     """
     matches = list(SECTION_PATTERN.finditer(content))
-    sections: list[dict[str, Any]] = []
+    parsed: list[tuple[re.Match, str, int]] = []
+    for m in matches:
+        open_idx = m.end() - 1  # index of the '{' (SECTION_PATTERN ends on it)
+        extracted = _extract_braced(content, open_idx)
+        if extracted is None:
+            # Malformed — skip this occurrence but continue scanning others.
+            continue
+        title, after_close = extracted
+        parsed.append((m, title, after_close))
 
-    for i, m in enumerate(matches):
+    sections: list[dict[str, Any]] = []
+    for i, (m, title, header_end) in enumerate(parsed):
         sec_type = m.group(1)
-        title = m.group(2)
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
-        body = content[start:end].strip()
+        end = parsed[i + 1][0].start() if i + 1 < len(parsed) else len(content)
+        body = content[header_end:end].strip()
         preview = body[:200] + "…" if len(body) > 200 else body
 
         sections.append(
@@ -76,15 +115,21 @@ def update_section(
         if sec["title"].lower() != title.lower():
             continue
 
-        # Find where the header ends
-        header_re = re.compile(
-            rf"\\{sec['type']}\*?\{{{re.escape(sec['title'])}\}}"
+        # Find where the header ends — re-run the balanced-brace walker
+        # on the known start position so that titles containing nested
+        # braces (e.g. ``\section{Foo \texttt{bar}}``) work correctly.
+        start_re = re.compile(
+            rf"\\{re.escape(sec['type'])}\*?\s*\{{"
         )
-        hm = header_re.search(content)
+        hm = start_re.search(content, sec["start_pos"])
         if not hm:
             return None
 
-        header_end = hm.end()
+        extracted = _extract_braced(content, hm.end() - 1)
+        if extracted is None:
+            return None
+        _title, header_end = extracted
+
         return (
             content[:header_end]
             + "\n"

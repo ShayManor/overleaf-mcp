@@ -18,7 +18,18 @@ logger = logging.getLogger("overleaf-mcp")
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-TEMP_DIR = os.environ.get("OVERLEAF_TEMP_DIR", "./overleaf_cache")
+# Resolve TEMP_DIR to an *absolute* path at import time so the cache
+# location is independent of the process's current working directory.
+# A relative default like ``./overleaf_cache`` would silently redirect to
+# a different filesystem location every time another library (or the host
+# MCP runtime) chdirs — historically this caused deeply-nested
+# ``overleaf_cache/<id>/overleaf_cache/<id>/…`` duplicates, stale ``Repo``
+# handles, and cryptic ``FileExistsError: [Errno 17] File exists: '.'``
+# bubbling up from GitPython. Absolutising once at startup eliminates the
+# whole class of cwd-coupled bugs.
+TEMP_DIR = os.path.abspath(
+    os.path.expanduser(os.environ.get("OVERLEAF_TEMP_DIR", "./overleaf_cache"))
+)
 OVERLEAF_BASE_URL = os.environ.get("OVERLEAF_BASE_URL", "https://www.overleaf.com")
 OVERLEAF_GIT_HOST = os.environ.get("OVERLEAF_GIT_HOST", "git.overleaf.com")
 
@@ -66,8 +77,10 @@ def get_project(project_id: str) -> ProjectConfig:
             "24-character lowercase hex strings (e.g. '692a83fb82feceb233c4b0e7'). "
             "This tool operates on the REMOTE Overleaf repo, not your local filesystem — "
             "a filesystem path like '.' or 'overleaf-project/' is NOT a project_id. "
-            "If the project is already downloaded locally, use the standard read_files / "
-            "grep_search tools on the local path instead. "
+            "These overleaf_* tools are ONLY for Overleaf projects — do not call them "
+            "for generic local file I/O; use the standard read_files / grep_search tools "
+            "for that. If you already have a checked-out copy of THIS Overleaf project "
+            "locally, use read_files / grep_search on that local path instead. "
             "Otherwise, call list_projects to discover the correct 24-hex ID."
         )
     token = _get_git_token()
