@@ -1,6 +1,6 @@
 [project]
 name = "overleaf-mcp-plus"
-version = "0.2.1"
+version = "0.3.0"
 description = "The most comprehensive MCP server for Overleaf — full CRUD, compile, PDF download, git history, diff, and more. (The `overleaf-mcp` name on PyPI is taken by a smaller read-only project, hence the `-plus` suffix; the CLI command is still `overleaf-mcp`.)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,10 +17,31 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    # MCP SDK v2 (protocol revision 2026-07-28). 0.3.0 ports the registration
+    # layer from the v1 decorator API (@server.list_tools / @server.call_tool)
+    # to v2's ``on_list_tools=`` / ``on_call_tool=`` constructor parameters.
+    #
+    # WHY THIS IS A FLOOR OF 2 AND NOT A WIDE RANGE: the two APIs are mutually
+    # exclusive. v2 removed the decorators outright (no ``__getattr__``
+    # fallback), and v1 has no ``on_*`` parameters, so a single codebase cannot
+    # serve both without a runtime shim. Staying on <2 was rejected as the
+    # end state: the v1 line does NOT speak the 2026-07-28 revision (its
+    # protocol constants stop at 2025-11-25), it is a maintenance line, and
+    # HTTP+SSE is inside a 12-month deprecation window — pinning users under
+    # v1 forever would strand them on the old protocol.
+    #
+    # Users who must stay on the v1 SDK should install 0.2.2, which is the
+    # same feature set pinned to ``mcp<2``.
+    "mcp>=2,<3",
     "httpx>=0.27.0",
     "gitpython>=3.1.40",
     "pydantic>=2.0.0",
+    # Citation verification (verify_citations tool) reuses the SAME verifier
+    # core as Tofu's paper mode — single source of truth, no second
+    # implementation. The `verify` subpackage landed in tofu-search 0.4.0, so
+    # that is the floor; the tool degrades with a clear upgrade hint on a
+    # stale install (see overleaf_mcp/verify.py::verify_available).
+    "tofu-search>=0.4.0",
 ]
 
 [project.optional-dependencies]

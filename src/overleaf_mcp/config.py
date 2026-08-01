@@ -40,6 +40,19 @@ DIFF_CONTEXT_LINES = int(os.environ.get("DIFF_CONTEXT_LINES", "3"))
 DIFF_MAX_OUTPUT_CHARS = int(os.environ.get("DIFF_MAX_OUTPUT_CHARS", "120000"))
 
 
+def project_url(project_id: str) -> str:
+    """Return the canonical web URL for a project on this deployment.
+
+    Uses ``OVERLEAF_BASE_URL`` so self-hosted Overleaf instances produce
+    correct links (the public default is ``https://www.overleaf.com``).
+    Returns '' for a falsy/invalid id so callers can omit the link rather
+    than emit a broken ``…/project/`` URL.
+    """
+    if not project_id or not _PROJECT_ID_RE.match(project_id):
+        return ""
+    return f"{OVERLEAF_BASE_URL.rstrip('/')}/project/{project_id}"
+
+
 class ProjectConfig(BaseModel):
     """Configuration for a single Overleaf project."""
 

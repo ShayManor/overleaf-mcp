@@ -26,6 +26,7 @@ from .config import (
     OVERLEAF_GIT_HOST,
     TEMP_DIR,
     ProjectConfig,
+    project_url,
 )
 from .metadata import write_metadata
 
@@ -115,17 +116,23 @@ def _resolve_project_name(project_id: str) -> str | None:
 
 
 def _project_tag(project: ProjectConfig) -> str:
-    """Build a human-readable ``[Name] (short…id)`` tag for a project.
+    """Build a human-readable ``[Name] (short…id) <url>`` tag for a project.
 
-    Falls back to ``(short…id)`` if the natural name cannot be resolved.
-    Used in the return messages of write operations so users can see at a
-    glance *which* Overleaf project was modified.
+    Falls back to ``(short…id) <url>`` if the natural name cannot be
+    resolved. Used in the return messages of write operations so users can
+    see at a glance *which* Overleaf project was modified — and click
+    straight through to it.
+
+    The canonical URL is derived from ``OVERLEAF_BASE_URL`` (see
+    :func:`config.project_url`), so self-hosted deployments link correctly
+    and MCP clients can turn the bare ID jumble into a real hyperlink
+    instead of guessing the host.
     """
     sid = _short_id(project.project_id)
     name = _resolve_project_name(project.project_id)
-    if name:
-        return f"[{name}] ({sid})"
-    return f"({sid})"
+    url = project_url(project.project_id)
+    head = f"[{name}] ({sid})" if name else f"({sid})"
+    return f"{head} {url}" if url else head
 
 
 def _repo_path(project_id: str) -> Path:

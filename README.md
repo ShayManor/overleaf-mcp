@@ -46,13 +46,14 @@ AI:  [compile_project + download_pdf] PDF saved to ~/Desktop/thesis.pdf ✓
 | **compile_project** | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ |
 | **download_pdf** | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ |
 | **download_log** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **page/layout (SyncTeX)** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | sync_project | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
 | status_summary | ✅ | ❌ | ✅ | ❌ | ✅ | ✅ |
 | Multi-project | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Thread-safe locking | ✅ | ❌ | ✅ (Redis) | ❌ | ❌ | ❌ |
 | Docker support | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ |
 | Free Overleaf tier | ✅† | ❌ | ❌ | ✅ | ❌ | ❌ |
-| **Total tools** | **18** | 12 | 9 | 6 | 8 | 6 |
+| **Total tools** | **21** | 12 | 9 | 6 | 8 | 6 |
 
 \* Full file rewrite only, not surgical old→new replacement.
 † Compile/download tools work on the free tier via session cookie; Git-based tools require Git integration.
@@ -61,7 +62,7 @@ AI:  [compile_project + download_pdf] PDF saved to ~/Desktop/thesis.pdf ✓
 
 ## ✨ Key Advantages
 
-- **18 tools** — the most of any Overleaf MCP server
+- **21 tools** — the most of any Overleaf MCP server
 - **Zero config** — just two env vars, no config files, no per-project setup
 - **Dual auth** — Git tokens for read/write + session cookies for compile/download
 - **Surgical edits** — `edit_file` does exact search-and-replace (like `sed`), not full rewrites
@@ -69,6 +70,7 @@ AI:  [compile_project + download_pdf] PDF saved to ~/Desktop/thesis.pdf ✓
 - **Git history & diff** — review changes, compare versions, filter by file/date
 - **Compilation** — trigger builds and download PDFs without leaving your AI chat
 - **Compilation logs** — `download_log` for debugging LaTeX errors
+- **Page-layout perception** — `get_page_count` / `locate_in_pdf` / `section_page_map` expose *where* content lands in the rendered PDF (via SyncTeX), so the AI can answer "which page is section X on?" and drive a fill-exactly-N-pages loop
 - **Thread-safe** — per-project locks prevent concurrent git corruption
 - **Clean Python** — modular architecture, type hints, async throughout
 
@@ -231,6 +233,7 @@ You can start with just the cookie and add the git token later.
 | `read_file` | Read file contents |
 | `get_sections` | Parse LaTeX section hierarchy with previews |
 | `get_section_content` | Get full content of a section by title |
+| `verify_citations` | Detect likely-hallucinated references: verify each `.bib` entry's DOI/arXiv id against CrossRef & arXiv (zero LLM). Reports verified / suspicious / unverifiable buckets |
 | `list_history` | Git commit history (with date/file/limit filters) |
 | `get_diff` | Git diff between refs or working tree |
 | `status_summary` | Project overview: file count, structure, status |
@@ -258,6 +261,14 @@ You can start with just the cookie and add the git token later.
 | `download_pdf` | Download compiled PDF to local path |
 | `download_log` | Download compilation log for debugging |
 
+### Layout & page positions (SyncTeX)
+
+| Tool | Description |
+|---|---|
+| `get_page_count` | Compile and report the total number of PDF pages (from the LaTeX log, PDF-parse fallback) |
+| `locate_in_pdf` | Find which page (and bounding box) a given source line lands on, via SyncTeX |
+| `section_page_map` | Map every section/subsection heading (and `\end{document}`) to its PDF page, plus **two fullness figures for the last page**: against the physical page (real height from the PDF MediaBox — correct for A4/Letter/custom `geometry`) *and* against the printable text body (bottom margin excluded, derived from the log's `geometry` dump) with a rough "N more lines fit" estimate. The text-area figure is the actionable one for a fill-exactly-N-pages workflow — the "where is each element on the page" overview. Built by parsing `output.synctex.gz` **offline** (one artifact download + local decode, ~ms for the whole map) rather than one HTTP call per section, so it's O(1) requests and stays fast + reliable on long papers; falls back to the live `sync/code` endpoint if the artifact is missing |
+
 ---
 
 ## 💡 Usage Examples
@@ -268,6 +279,10 @@ You can start with just the cookie and add the git token later.
 "Read main.tex"
 "Show me the sections in chapter1.tex"
 "Get the content of the Introduction section"
+
+"How many pages does project 64a1b2c3d4e5f6a7b8c9d0e1 compile to?"
+"Which page does each section land on?"   (→ section_page_map)
+"Trim the intro so the paper fills exactly 7 pages"  (measure → edit → recompile loop)
 
 "Fix the typo: change 'teh' to 'the' in main.tex"
 "Rewrite the abstract with: [new text]"

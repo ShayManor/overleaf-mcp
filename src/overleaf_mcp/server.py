@@ -26,12 +26,20 @@ import json
 import logging
 from typing import Any
 
-from mcp.server import Server
+from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+    Tool,
+    ToolAnnotations,
+)
 
-from . import git_client
-from .config import get_project
+from . import __version__, git_client, verify as _verify_mod
+from .config import get_project, project_url
 from .credentials import get_git_token, get_session
 from .latex import get_section_content, parse_sections, update_section
 
@@ -44,6 +52,15 @@ try:
     _HAS_COMPILE = True
 except ImportError:
     _HAS_COMPILE = False
+
+# Layout perception (page count + source→page locator via SyncTeX). Depends on
+# the same compile seam + session cookie, so it shares the _HAS_COMPILE guard.
+try:
+    from . import layout as _layout_mod
+
+    _HAS_LAYOUT = _HAS_COMPILE
+except ImportError:
+    _HAS_LAYOUT = False
 
 # ---------------------------------------------------------------------------
 # Shared schema fragment
@@ -141,6 +158,34 @@ _TOOLS: list[Tool] = [
                 "file_path": {"type": "string", "description": "Path to the file"},
             },
             "required": ["project_id", "file_path"],
+        },
+    ),
+    Tool(
+        name="verify_citations",
+        description=(
+            "Detect likely-hallucinated references in the project's "
+            "bibliography. Reads the project's .bib file(s), then verifies "
+            "each entry's DOI / arXiv id against free authoritative catalogues "
+            "(CrossRef, arXiv) with ZERO LLM calls. Returns three buckets: "
+            "verified (catalogue match), suspicious (a concrete identifier "
+            "that definitively does NOT resolve — high-confidence), and "
+            "unverifiable (no identifier / coverage gap / book / rate-limit — "
+            "reported separately and NEVER as fabrication). Use to sanity-check "
+            "an AI-assisted draft's citations before submission."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_PROP,
+                "bib_path": {
+                    "type": "string",
+                    "description": (
+                        "Optional explicit path to a .bib file. Omit to "
+                        "auto-discover every .bib in the project."
+                    ),
+                },
+            },
+            "required": ["project_id"],
         },
     ),
     Tool(
@@ -397,6 +442,80 @@ _TOOLS: list[Tool] = [
             "required": ["project_id"],
         },
     ),
+    # ── LAYOUT / SYNCTEX (page positions) ────────────────────────────────
+    Tool(
+        name="get_page_count",
+        description=(
+            "Compile the project and report the TOTAL number of pages in the "
+            "PDF (parsed from the LaTeX log, with a PDF-parse fallback). Use "
+            "this to answer 'how many pages is it?' or to drive a "
+            "fill-exactly-N-pages editing loop. Requires OVERLEAF_SESSION."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"project_id": _PROJECT_ID_PROP},
+            "required": ["project_id"],
+        },
+    ),
+    Tool(
+        name="locate_in_pdf",
+        description=(
+            "Find WHERE a given source line lands in the compiled PDF, using "
+            "SyncTeX. Returns the page number and bounding rectangle(s) "
+            "{page,h,v,width,height} in PostScript points (v measured from the "
+            "page top). Omit `file` to use the compile root. This is the "
+            "element→page-position capability the source parser cannot "
+            "provide. Requires OVERLEAF_SESSION."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_PROP,
+                "line": {
+                    "type": "integer",
+                    "description": "1-based source line number to locate.",
+                },
+                "file": {
+                    "type": "string",
+                    "description": (
+                        "Project-relative path of the source file (e.g. "
+                        "'main.tex' or 'latex/paper.tex'). Omit to use the "
+                        "compile root (auto-detected from SyncTeX)."
+                    ),
+                },
+                "column": {
+                    "type": "integer",
+                    "description": "1-based column (default 0). Usually leave unset.",
+                },
+            },
+            "required": ["project_id", "line"],
+        },
+    ),
+    Tool(
+        name="section_page_map",
+        description=(
+            "Compile once, then map EVERY section/subsection heading (and "
+            "\\end{document}) to the PDF page it starts on, plus the total "
+            "page count. This is the 'perceive the position of each element on "
+            "the page' overview — ideal for judging how content is distributed "
+            "across pages and for a fill-exactly-N-pages workflow. Omit `file` "
+            "to use the compile root. Requires OVERLEAF_SESSION."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_PROP,
+                "file": {
+                    "type": "string",
+                    "description": (
+                        "Project-relative path of the root .tex file. Omit to "
+                        "auto-detect the compile root from SyncTeX."
+                    ),
+                },
+            },
+            "required": ["project_id"],
+        },
+    ),
     # ── SOURCE DOWNLOAD ──────────────────────────────────────────────────
     Tool(
         name="download_source_zip",
@@ -446,6 +565,149 @@ _TOOLS: list[Tool] = [
 ]
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool safety annotations
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# WHY THIS EXISTS
+# ---------------
+# ``annotations.readOnlyHint`` is not documentation — it is a CONTROL SIGNAL.
+# An MCP host cannot know whether a tool mutates anything, so a careful host
+# must assume the worst: it treats every un-annotated tool as a write, which
+# means SERIAL dispatch and (in manual/approval modes) a confirmation prompt
+# per call. Leaving all 25 tools un-annotated therefore forced a purely
+# read-only workflow — open a project, list files, read a few, diff two
+# revisions — down a one-at-a-time path with a prompt on every step.
+#
+# The hints are declared here as ONE table rather than inline on each ``Tool``
+# so the whole safety partition can be read (and reviewed) at a glance; the
+# completeness check below makes it impossible to add a tool and forget it.
+#
+# WHY WRITES ARE DECLARED EXPLICITLY RATHER THAN LEFT TO THE DEFAULT
+# -------------------------------------------------------------------
+# ``readOnlyHint`` defaults to false, so a write tool works fine unannotated.
+# But "absent" and "false" mean different things to a reviewer: absent says
+# nobody classified this tool, false says someone did and it mutates. Only the
+# second is auditable, and only the second survives a new tool being added by
+# someone who never read this comment.
+#
+# HOW EACH VERDICT WAS REACHED (derived from the dispatch branch, NOT the name)
+# -----------------------------------------------------------------------------
+# The spec's wording is "the tool does not modify its ENVIRONMENT" — not "does
+# not modify the remote project". Reading the implementations against that
+# wider test moves seven tools that *sound* read-only out of the read set:
+#
+#   * compile_project / download_log / get_page_count / locate_in_pdf /
+#     section_page_map — every one of these RUNS A COMPILE on Overleaf's
+#     servers (``layout._compile_with_editor_id`` mirrors
+#     ``compile.compile_project``). That consumes remote compute, mutates the
+#     project's build state, and is exactly the kind of expensive side effect
+#     a host serializes deliberately. "It returns information" does not make
+#     an operation read-only; what matters is what it does to get it.
+#   * download_pdf / download_source_zip / download_source — these WRITE TO
+#     THE USER'S FILESYSTEM at a caller-supplied path, and ``download_source``
+#     can overwrite a non-empty directory when ``overwrite=true``. The local
+#     disk is part of the environment.
+#   * list_projects is a genuine read of the account's project list. It is
+#     kept read-only: it touches the web dashboard only, runs no compile and
+#     writes nothing.
+#
+# ``destructiveHint`` and ``idempotentHint`` are meaningful ONLY when
+# ``readOnlyHint`` is false (per the spec), so they appear only on writes.
+
+#: Tools that observe without changing anything: no remote mutation, no
+#: compile, no local file writes.
+_READ_ONLY_TOOLS = frozenset({
+    "list_projects",
+    "list_files",
+    "read_file",
+    "verify_citations",
+    "get_sections",
+    "get_section_content",
+    "list_history",
+    "get_diff",
+    "status_summary",
+})
+
+#: Tools that change something — remote project state, remote compute, or the
+#: local filesystem. Value is ``(destructive, idempotent)``; ``None`` leaves a
+#: hint unstated rather than guessing.
+#:
+#: "destructive" follows the spec's own split: true when a call may DESTROY or
+#: overwrite existing state, false when the update is purely additive.
+_WRITE_TOOLS = {
+    # ── Remote project mutations ──
+    "create_file":         (False, False),  # additive; fails if it exists
+    "create_project":      (False, False),  # additive: makes a new project
+    "upload_file":         (True,  False),  # overwrite=true replaces a file
+    "edit_file":           (True,  False),  # rewrites a region of a file
+    "rewrite_file":        (True,  False),  # replaces entire file contents
+    "update_section":      (True,  False),  # replaces a section body
+    "delete_file":         (True,  False),  # removes a file outright
+    # git pull: converges the local clone onto the remote; running it twice
+    # changes nothing further, and it destroys no user-authored state.
+    "sync_project":        (False, True),
+    # ── Remote compute (a compile is a real side effect) ──
+    "compile_project":     (False, False),
+    "download_log":        (False, False),
+    "get_page_count":      (False, False),
+    "locate_in_pdf":       (False, False),
+    "section_page_map":    (False, False),
+    # ── Local filesystem writes ──
+    "download_pdf":        (True,  True),   # overwrites output_path
+    "download_source_zip": (True,  True),   # overwrites output_path
+    "download_source":     (True,  True),   # overwrite=true clobbers a dir
+}
+
+
+def _apply_tool_annotations(tools: list[Tool]) -> None:
+    """Stamp every tool with its safety hints, refusing to leave one unclassified.
+
+    Raises:
+        RuntimeError: a tool is missing from both tables, appears in both, or a
+            table names a tool that does not exist. Failing at import time is
+            deliberate: a silently unclassified tool would default to "write"
+            and quietly lose its parallelism, which is precisely the regression
+            this table exists to prevent — and a missing WRITE classification
+            would be far worse, since it decides whether a destructive call is
+            allowed to skip an approval prompt.
+    """
+    names = {t.name for t in tools}
+    classified = _READ_ONLY_TOOLS | set(_WRITE_TOOLS)
+
+    both = _READ_ONLY_TOOLS & set(_WRITE_TOOLS)
+    if both:
+        raise RuntimeError(
+            f"tool(s) declared BOTH read-only and write: {sorted(both)}")
+    unclassified = names - classified
+    if unclassified:
+        raise RuntimeError(
+            f"tool(s) missing a safety classification: {sorted(unclassified)}. "
+            f"Add each to _READ_ONLY_TOOLS or _WRITE_TOOLS in server.py — a "
+            f"tool left unclassified silently becomes a serial, "
+            f"approval-gated write."
+        )
+    phantom = classified - names
+    if phantom:
+        raise RuntimeError(
+            f"safety table names non-existent tool(s): {sorted(phantom)}")
+
+    for tool in tools:
+        if tool.name in _READ_ONLY_TOOLS:
+            tool.annotations = ToolAnnotations(readOnlyHint=True)
+        else:
+            destructive, idempotent = _WRITE_TOOLS[tool.name]
+            tool.annotations = ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=destructive,
+                idempotentHint=idempotent,
+            )
+
+
+_apply_tool_annotations(_TOOLS)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool dispatch
 # ═══════════════════════════════════════════════════════════════════════════
@@ -473,22 +735,85 @@ If a tool fails with an auth error, tell the user which env var to
 update in their MCP server configuration, and how to obtain a fresh value.
 """
 
-server = Server("overleaf-mcp", instructions=_SERVER_INSTRUCTIONS)
+# ═══════════════════════════════════════════════════════════════════════════
+# Handler registration — MCP SDK v2 (``on_*`` constructor parameters)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# v1 registered handlers with decorators::
+#
+#     server = Server("overleaf-mcp", ...)
+#
+#     @server.list_tools()
+#     async def handle_list_tools() -> list[Tool]: ...
+#
+#     @server.call_tool()
+#     async def handle_call_tool(name, arguments) -> list[TextContent]: ...
+#
+# SDK 2.0.0 REMOVED that API outright — the low-level ``Server`` has no
+# ``list_tools`` / ``call_tool`` attribute and no ``__getattr__`` fallback, so
+# the decorators raised ``AttributeError`` AT IMPORT TIME (module scope), which
+# is why 0.2.1 could not even start against mcp 2.x.
+#
+# Three things changed together, and all three matter:
+#   1. Handlers are passed to the CONSTRUCTOR, not attached afterwards — so
+#      they must be defined BEFORE the ``Server(...)`` call below.
+#   2. Each handler receives ``(ctx, params)``. The request context is the
+#      first argument; the old bare ``(name, arguments)`` shape is gone.
+#   3. Handlers return the FULL result type (``ListToolsResult`` /
+#      ``CallToolResult``). v2 removed the automatic wrapping that used to turn
+#      a bare ``list[Tool]`` into a ``ListToolsResult``.
+#
+# One BEHAVIOURAL subtlety worth stating, because it is invisible in the diff:
+# v2 no longer converts an escaping exception into ``CallToolResult(is_error=
+# True)`` — a raised exception becomes a top-level JSON-RPC error instead, which
+# the model never sees as tool output. The ``try/except`` in the call handler is
+# therefore LOAD-BEARING under v2 in a way it was not under v1: it is the only
+# thing that keeps a failing tool visible to the LLM as text it can react to.
 
 
-@server.list_tools()
-async def handle_list_tools() -> list[Tool]:
-    return _TOOLS
+async def handle_list_tools(
+    ctx: ServerRequestContext,
+    params: PaginatedRequestParams | None,
+) -> ListToolsResult:
+    """Return the full tool catalogue.
+
+    ``_TOOLS`` is a module-level constant, so the order is already stable
+    across calls and reconnects — which the 2026-07-28 revision explicitly
+    asks for, since a shifting tool list invalidates the client's prompt cache.
+    """
+    return ListToolsResult(tools=_TOOLS)
 
 
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+async def handle_call_tool(
+    ctx: ServerRequestContext,
+    params: CallToolRequestParams,
+) -> CallToolResult:
+    """Dispatch one tool call and return its text result.
+
+    Errors are deliberately returned as a NORMAL result whose text starts with
+    ``Error:`` rather than raised. Two reasons, both load-bearing:
+      * under v2 a raised exception becomes a transport-level JSON-RPC error the
+        model cannot see or recover from;
+      * Tofu's MCP credential health-probe classifies this server by matching
+        phrases in the RESULT TEXT of a successful call (see the ``health_probe``
+        entry for 'overleaf' in Tofu's lib/mcp/registry.py). Flipping these to
+        ``is_error=True`` or to exceptions would silently break expiry detection.
+    """
     try:
-        result = await _dispatch(name, arguments)
-        return [TextContent(type="text", text=result)]
+        result = await _dispatch(params.name, params.arguments or {})
+        return CallToolResult(content=[TextContent(type="text", text=result)])
     except Exception as e:
-        logger.error("Tool %s failed: %s", name, e, exc_info=True)
-        return [TextContent(type="text", text=f"Error: {e}")]
+        logger.error("Tool %s failed: %s", params.name, e, exc_info=True)
+        return CallToolResult(content=[TextContent(type="text", text=f"Error: {e}")])
+
+
+server = Server(
+    "overleaf-mcp",
+    version=__version__,
+    instructions=_SERVER_INSTRUCTIONS,
+    on_list_tools=handle_list_tools,
+    on_call_tool=handle_call_tool,
+)
 
 
 # Tools that only need a session cookie (not a git token)
@@ -497,6 +822,9 @@ _COOKIE_ONLY_TOOLS = {
     "compile_project",
     "download_pdf",
     "download_log",
+    "get_page_count",
+    "locate_in_pdf",
+    "section_page_map",
     "download_source_zip",
     "download_source",
     "create_project",
@@ -613,10 +941,12 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         pid = result.get("id", "?")
         pname = result.get("name", args.get("name", "?"))
         short = f"{pid[:5]}…{pid[-4:]}" if pid and len(pid) >= 10 else pid
+        url = project_url(pid)
+        open_line = f"   Open: {url}\n" if url else ""
         return (
             f"✅ Created Overleaf project [{pname}]\n"
             f"   project_id: {pid}  (short: {short})\n"
-            f"   Open: https://www.overleaf.com/project/{pid}\n"
+            f"{open_line}"
             f"   Pass this project_id to other overleaf tools "
             f"(create_file, edit_file, compile_project, …)."
         )
@@ -650,7 +980,9 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         lines = [f"Your Overleaf projects ({len(web_projects)}):"]
         lines.append("")
         for wp in web_projects:
-            lines.append(f"  • {wp['name']}  [{wp['id']}]")
+            url = project_url(wp["id"])
+            tail = f"  {url}" if url else ""
+            lines.append(f"  • {wp['name']}  [{wp['id']}]{tail}")
         lines.append("")
         lines.append("Pass any project ID to other tools (e.g. read_file, edit_file, compile_project).")
         return "\n".join(lines)
@@ -669,6 +1001,31 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         project = get_project(args["project_id"])
         content = await asyncio.to_thread(git_client.read_file, project, args["file_path"])
         return f"── {args['file_path']} ({len(content)} chars) ──\n\n{content}"
+
+    if name == "verify_citations":
+        ok, why = _verify_mod.verify_available()
+        if not ok:
+            return f"Error: {why}"
+        project = get_project(args["project_id"])
+        explicit = (args.get("bib_path") or "").strip()
+        if explicit:
+            bib_paths = [explicit]
+        else:
+            bib_paths = await asyncio.to_thread(
+                git_client.list_files, project, _verify_mod._BIB_EXT)
+        if not bib_paths:
+            return ("No .bib file found in the project. Pass bib_path explicitly "
+                    "if your bibliography lives elsewhere.")
+
+        def _read(p):
+            return git_client.read_file(project, p)
+
+        combined, read_paths = await asyncio.to_thread(
+            _verify_mod.collect_bibtex, _read, bib_paths)
+        if not combined.strip():
+            return f"Bibliography file(s) {', '.join(bib_paths)} were empty or unreadable."
+        result = await asyncio.to_thread(_verify_mod.run_verification, combined)
+        return _verify_mod.format_report(result, read_paths)
 
     if name == "get_sections":
         project = get_project(args["project_id"])
@@ -750,8 +1107,13 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         all_files = await asyncio.to_thread(git_client.list_files, project)
 
         title = natural_name if natural_name else project.name
+        url = project_url(project.project_id)
         summary = [
             f"📄 Project: {title}  [{project.project_id}]",
+        ]
+        if url:
+            summary.append(f"   URL: {url}")
+        summary += [
             f"   Total files: {len(all_files)}",
             f"   .tex files: {len(files)}",
         ]
@@ -869,6 +1231,51 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         r = httpx.get(log_url, headers=_headers(), follow_redirects=True, timeout=30)
         r.raise_for_status()
         text = r.text
+    # ── LAYOUT / SYNCTEX ─────────────────────────────────────────────────
+
+    if name == "get_page_count":
+        if not _HAS_LAYOUT:
+            return "Error: compile extras required. pip install overleaf-mcp[compile]"
+        result = await asyncio.to_thread(_layout_mod.get_page_count, args["project_id"])
+        pages = result.get("pages")
+        if pages is None:
+            return (
+                f"Could not determine page count (compile status="
+                f"{result.get('status')}). Check compilation with download_log."
+            )
+        return (
+            f"{pages} page(s)  (status={result.get('status')}, "
+            f"source={result.get('source')})"
+        )
+
+    if name == "locate_in_pdf":
+        if not _HAS_LAYOUT:
+            return "Error: compile extras required. pip install overleaf-mcp[compile]"
+        result = await asyncio.to_thread(
+            _layout_mod.locate_in_pdf,
+            args["project_id"],
+            int(args["line"]),
+            args.get("file"),
+            int(args.get("column", 0)),
+        )
+        if result.get("error"):
+            return f"Error: {result['error']}"
+        if result.get("page") is None:
+            return (
+                f"No SyncTeX mapping for {result.get('file')!r} line "
+                f"{result.get('line')} (blank line/comment?). Try a nearby "
+                "non-empty line."
+            )
+        return json.dumps(result, indent=2)
+
+    if name == "section_page_map":
+        if not _HAS_LAYOUT:
+            return "Error: compile extras required. pip install overleaf-mcp[compile]"
+        result = await asyncio.to_thread(
+            _layout_mod.section_page_map, args["project_id"], args.get("file")
+        )
+        return _layout_mod.format_section_page_map(result)
+
         if len(text) > 50000:
             text = text[-50000:]
             return f"[… truncated to last 50000 chars]\n\n{text}"
