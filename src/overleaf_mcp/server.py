@@ -62,6 +62,24 @@ try:
 except ImportError:
     _HAS_LAYOUT = False
 
+# Comment threads (review panel). Same session-cookie auth path as compile —
+# it reuses compile's cookie header and CSRF scraper — so it shares the guard.
+try:
+    from . import threads as _threads_mod
+
+    _HAS_THREADS = _HAS_COMPILE
+except ImportError:
+    _HAS_THREADS = False
+
+# Comment CREATION needs the realtime channel (socket.io), not REST — it is
+# the only non-REST module here, and the only one needing websocket-client.
+try:
+    from . import realtime as _realtime_mod
+
+    _HAS_REALTIME = _HAS_THREADS and _realtime_mod._HAS_WS
+except ImportError:
+    _HAS_REALTIME = False
+
 # ---------------------------------------------------------------------------
 # Shared schema fragment
 # ---------------------------------------------------------------------------
@@ -562,6 +580,158 @@ _TOOLS: list[Tool] = [
             "required": ["project_id", "output_dir"],
         },
     ),
+    # ── COMMENT THREADS (review panel) ───────────────────────────────────
+    Tool(
+        name="list_threads",
+        description=(
+            "List the review-panel COMMENT THREADS on an Overleaf project — "
+            "the co-author comments in the right-hand sidebar, which are "
+            "absent from both the git clone and the source download. Returns "
+            "each thread's id, resolved state, full message history, and (when "
+            "still anchored) the doc_id, the quoted passage it hangs off, and "
+            "its character offset. Use this to find work to do, then "
+            "reply_to_thread and resolve_thread on each. Requires "
+            "OVERLEAF_SESSION env var."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_PROP,
+                "include_resolved": {
+                    "type": ["boolean", "string"],
+                    "description": (
+                        "Include already-resolved threads. Default true. "
+                        "Accepts boolean or case-insensitive string."
+                    ),
+                },
+            },
+            "required": ["project_id"],
+        },
+    ),
+    Tool(
+        name="reply_to_thread",
+        description=(
+            "Post a reply on an existing comment thread. The reply appears in "
+            "every co-author's review panel within seconds, under YOUR "
+            "account, so it is automatically prefixed with OVERLEAF_REVIEW_PREFIX "
+            "(default '[auto]') to mark it machine-written. Cannot create a NEW "
+            "comment on a text range — Overleaf binds those over the realtime "
+            "channel, not REST. Requires OVERLEAF_SESSION env var."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_PROP,
+                "thread_id": {
+                    "type": "string",
+                    "description": "Thread id from list_threads.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": (
+                        "Reply body. Say what you changed, concretely — this is "
+                        "what the co-author reads in the sidebar. If you "
+                        "rewrote the passage the comment is anchored to, the "
+                        "quoted text they see is now stale, so make the reply "
+                        "stand on its own."
+                    ),
+                },
+            },
+            "required": ["project_id", "thread_id", "content"],
+        },
+    ),
+    Tool(
+        name="resolve_thread",
+        description=(
+            "Mark a comment thread resolved, moving it out of the co-authors' "
+            "open-comments panel. DO NOT call this routinely: resolving is the "
+            "COMMENTER'S call, since they decide whether their comment was "
+            "addressed. Reply with what you changed and leave the thread open "
+            "unless the user explicitly asks you to resolve that thread. "
+            "Requires OVERLEAF_SESSION env var."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_PROP,
+                "thread_id": {
+                    "type": "string",
+                    "description": "Thread id from list_threads.",
+                },
+                "doc_id": {
+                    "type": "string",
+                    "description": (
+                        "Document the thread is anchored to. Optional — looked "
+                        "up automatically from the project ranges."
+                    ),
+                },
+            },
+            "required": ["project_id", "thread_id"],
+        },
+    ),
+    Tool(
+        name="create_comment",
+        description=(
+            "Create a NEW comment thread anchored to a passage of the source, "
+            "exactly as if you had selected the text in the editor and hit "
+            "comment. Co-authors see it in their review panel like any other "
+            "comment. `anchor_text` must match the source VERBATIM including "
+            "LaTeX markup; use `occurrence` when it appears more than once. "
+            "Use this to raise a question you cannot resolve yourself, or to "
+            "flag something for a co-author. Requires OVERLEAF_SESSION."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_PROP,
+                "anchor_text": {
+                    "type": "string",
+                    "description": (
+                        "The exact passage to attach the comment to, copied "
+                        "verbatim from the source. Keep it short and unique."
+                    ),
+                },
+                "content": {"type": "string", "description": "The comment body."},
+                "file": {
+                    "type": "string",
+                    "description": (
+                        "Project-relative path of the file (e.g. 'main.tex'). "
+                        "Omit to use the project's root document."
+                    ),
+                },
+                "occurrence": {
+                    "type": "integer",
+                    "description": "Which match to anchor to, 1-based. Default 1.",
+                },
+            },
+            "required": ["project_id", "anchor_text", "content"],
+        },
+    ),
+    Tool(
+        name="reopen_thread",
+        description=(
+            "Reopen a resolved comment thread, putting it back in the "
+            "co-authors' open-comments panel. Requires OVERLEAF_SESSION env var."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_PROP,
+                "thread_id": {
+                    "type": "string",
+                    "description": "Thread id from list_threads.",
+                },
+                "doc_id": {
+                    "type": "string",
+                    "description": (
+                        "Document the thread is anchored to. Optional — looked "
+                        "up automatically from the project ranges."
+                    ),
+                },
+            },
+            "required": ["project_id", "thread_id"],
+        },
+    ),
 ]
 
 
@@ -623,6 +793,7 @@ _READ_ONLY_TOOLS = frozenset({
     "list_files",
     "read_file",
     "verify_citations",
+    "list_threads",
     "get_sections",
     "get_section_content",
     "list_history",
@@ -645,6 +816,13 @@ _WRITE_TOOLS = {
     "rewrite_file":        (True,  False),  # replaces entire file contents
     "update_section":      (True,  False),  # replaces a section body
     "delete_file":         (True,  False),  # removes a file outright
+    # Comment threads: a reply is purely additive; resolve/reopen flip one
+    # boolean and destroy no message, so neither is destructive, and both
+    # converge on the same state when repeated.
+    "reply_to_thread":     (False, False),
+    "create_comment":      (False, False),  # additive: mints a new thread
+    "resolve_thread":      (False, True),
+    "reopen_thread":       (False, True),
     # git pull: converges the local clone onto the remote; running it twice
     # changes nothing further, and it destroys no user-authored state.
     "sync_project":        (False, True),
@@ -828,6 +1006,11 @@ _COOKIE_ONLY_TOOLS = {
     "download_source_zip",
     "download_source",
     "create_project",
+    "list_threads",
+    "reply_to_thread",
+    "create_comment",
+    "resolve_thread",
+    "reopen_thread",
 }
 
 
@@ -1297,6 +1480,73 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
             args["output_dir"],
             _coerce_bool(args.get("overwrite"), default=False),
         )
+
+    # ── COMMENT THREADS ──────────────────────────────────────────────────
+
+    if name == "list_threads":
+        if not _HAS_THREADS:
+            return "Error: compile extras required. pip install overleaf-mcp[compile]"
+        result = await asyncio.to_thread(
+            _threads_mod.list_threads,
+            args["project_id"],
+            _coerce_bool(args.get("include_resolved"), default=True),
+        )
+        if not result:
+            return "No comment threads on this project."
+        return json.dumps(result, indent=2)
+
+    if name == "reply_to_thread":
+        if not _HAS_THREADS:
+            return "Error: compile extras required. pip install overleaf-mcp[compile]"
+        result = await asyncio.to_thread(
+            _threads_mod.reply_to_thread,
+            args["project_id"],
+            args["thread_id"],
+            args["content"],
+        )
+        return f"✅ Replied on thread {args['thread_id']}.\n{json.dumps(result, indent=2)}"
+
+    if name == "create_comment":
+        if not _HAS_REALTIME:
+            return (
+                "Error: comment creation needs the compile extras "
+                "(websocket-client). pip install overleaf-mcp[compile]"
+            )
+        result = await asyncio.to_thread(
+            _realtime_mod.create_comment,
+            args["project_id"],
+            args["anchor_text"],
+            args["content"],
+            args.get("file"),
+            int(args.get("occurrence", 1)),
+        )
+        return (
+            f"✅ Created comment thread {result['thread_id']} on "
+            f"{result['file']} at {result['quoted_text']!r}.\n"
+            f"{json.dumps(result, indent=2)}"
+        )
+
+    if name == "resolve_thread":
+        if not _HAS_THREADS:
+            return "Error: compile extras required. pip install overleaf-mcp[compile]"
+        result = await asyncio.to_thread(
+            _threads_mod.resolve_thread,
+            args["project_id"],
+            args["thread_id"],
+            args.get("doc_id"),
+        )
+        return f"✅ Resolved thread {result['thread_id']} (doc {result['doc_id']})."
+
+    if name == "reopen_thread":
+        if not _HAS_THREADS:
+            return "Error: compile extras required. pip install overleaf-mcp[compile]"
+        result = await asyncio.to_thread(
+            _threads_mod.reopen_thread,
+            args["project_id"],
+            args["thread_id"],
+            args.get("doc_id"),
+        )
+        return f"✅ Reopened thread {result['thread_id']} (doc {result['doc_id']})."
 
     return f"Unknown tool: {name}"
 

@@ -20,3 +20,6 @@ dist_030/
 # Promo material is deliberately not published (matches the sdist allowlist)
 promo/
 mobkatt78pofq9-demo.png
+# Working spec, not shipped
+spec.md
+.idea/

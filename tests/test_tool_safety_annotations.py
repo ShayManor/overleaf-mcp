@@ -52,7 +52,7 @@ from overleaf_mcp import server as srv  # noqa: E402
 EXPECTED_READ_ONLY = {
     'list_projects', 'list_files', 'read_file', 'verify_citations',
     'get_sections', 'get_section_content', 'list_history', 'get_diff',
-    'status_summary',
+    'status_summary', 'list_threads',
 }
 
 #: name -> (destructive, idempotent) for every mutating tool.
@@ -73,6 +73,10 @@ EXPECTED_WRITE = {
     'download_pdf':        (True,  True),
     'download_source_zip': (True,  True),
     'download_source':     (True,  True),
+    'reply_to_thread':     (False, False),
+    'create_comment':      (False, False),
+    'resolve_thread':      (False, True),
+    'reopen_thread':       (False, True),
 }
 
 
