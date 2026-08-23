@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
-from git import GitCommandError, Repo
+from git import GitCommandError, PushInfo, Repo
 
 from .config import (
     DIFF_CONTEXT_LINES,
@@ -154,6 +154,16 @@ def _config_git_user(repo: Repo) -> None:
             cw.set_value("user", "name", name)
             cw.set_value("user", "email", email)
 
+    # Always pin a reconcile strategy. Without this, ``git pull`` aborts with
+    # "Need to specify how to reconcile divergent branches" the moment the
+    # Overleaf side gains a commit we do not have, which leaves the clone
+    # permanently diverged and silently serving stale content to readers.
+    try:
+        with repo.config_writer() as cw:
+            cw.set_value("pull", "rebase", "true")
+    except Exception as e:  # pragma: no cover - best effort
+        logger.warning("could not set pull.rebase: %s", e)
+
 
 def validate_path(base: Path, target: str) -> Path:
     """Ensure *target* doesn't escape the repo root.
@@ -197,6 +207,72 @@ def _retry_push(op: Callable[[], T], what: str) -> T:
             time.sleep(delay)
     assert last_exc is not None
     raise last_exc
+
+
+class PushRejected(Exception):
+    """The remote refused our refs — normally because Overleaf moved ahead.
+
+    Deliberately NOT a ``GitCommandError`` so :func:`_retry_push` does not
+    burn its backoff budget retrying a rejection that will never succeed on
+    its own. Transient 5xx failures stay retryable; rejections get rebased.
+    """
+
+
+def _push_once(repo: Repo) -> None:
+    """One push attempt that actually reports whether the refs landed.
+
+    ``Remote.push()`` does not raise on rejection: it returns a
+    ``PushInfoList`` whose entries carry ERROR/REJECTED flags, with the
+    exception parked on ``.error``. Reading the flags is the only reliable
+    signal, because the porcelain stderr GitPython surfaces ("failed to push
+    some refs") does not contain the words "non-fast-forward" or "rejected".
+    """
+    infos = repo.remotes.origin.push()
+    error = getattr(infos, "error", None)
+    if error is None:
+        return
+    rejected_mask = PushInfo.REJECTED | PushInfo.REMOTE_REJECTED
+    if any(getattr(i, "flags", 0) & rejected_mask for i in infos):
+        raise PushRejected(str(error))
+    raise error
+
+
+def _push_checked(repo: Repo, what: str) -> None:
+    """Push and verify it landed, healing the Overleaf-UI race once.
+
+    Without this, a rejected push looked exactly like a successful one: the
+    tool answered "✅", the commit stayed in the local clone, and because the
+    git-side readers read that clone, every later read echoed the caller's
+    own unpushed text back at them.
+    """
+    try:
+        _retry_push(lambda: _push_once(repo), what)
+        return
+    except PushRejected as e:
+        logger.warning("%s rejected (%s); rebasing onto origin and retrying", what, e)
+
+    try:
+        repo.git.pull("--rebase", "origin")
+    except GitCommandError as e:
+        # Never leave the clone parked mid-rebase; a half-finished rebase
+        # breaks every subsequent tool call on this project.
+        try:
+            repo.git.rebase("--abort")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"{what} was rejected and the rebase onto origin failed: {e}. "
+            "Nothing was pushed and the clone was left clean; the project "
+            "needs manual reconciliation."
+        ) from e
+
+    try:
+        _retry_push(lambda: _push_once(repo), f"{what} (after rebase)")
+    except PushRejected as e:
+        raise RuntimeError(
+            f"{what} still rejected after rebasing onto origin: {e}. "
+            "Nothing was pushed."
+        ) from e
 
 
 def _pull_if_stale(repo: Repo, project_id: str) -> None:
@@ -428,7 +504,7 @@ def create_file(
         _config_git_user(repo)
         repo.index.add([file_path])
         repo.index.commit(commit_message or f"Add {file_path}")
-        _retry_push(lambda: repo.remotes.origin.push(), f"push(create {file_path})")
+        _push_checked(repo, f"push(create {file_path})")
         return f"✅ Created '{file_path}' in project {_project_tag(project)}"
 
 
@@ -468,7 +544,7 @@ def edit_file(
         _config_git_user(repo)
         repo.index.add([file_path])
         repo.index.commit(commit_message or f"Edit {file_path}")
-        _retry_push(lambda: repo.remotes.origin.push(), f"push(edit {file_path})")
+        _push_checked(repo, f"push(edit {file_path})")
         return f"✅ Edited '{file_path}' in project {_project_tag(project)}"
 
 
@@ -494,7 +570,7 @@ def rewrite_file(
         _config_git_user(repo)
         repo.index.add([file_path])
         repo.index.commit(commit_message or f"Rewrite {file_path}")
-        _retry_push(lambda: repo.remotes.origin.push(), f"push(rewrite {file_path})")
+        _push_checked(repo, f"push(rewrite {file_path})")
         return f"✅ Rewrote '{file_path}' in project {_project_tag(project)}"
 
 
@@ -547,7 +623,7 @@ def upload_file(
         _config_git_user(repo)
         repo.index.add([file_path])
         repo.index.commit(commit_message or f"Upload {file_path}")
-        _retry_push(lambda: repo.remotes.origin.push(), f"push(upload {file_path})")
+        _push_checked(repo, f"push(upload {file_path})")
         size_kb = len(data) / 1024
         verb = "Replaced" if existed else "Uploaded"
         return (
@@ -574,7 +650,7 @@ def delete_file(
         repo.index.remove([file_path])
         target.unlink()
         repo.index.commit(commit_message or f"Delete {file_path}")
-        _retry_push(lambda: repo.remotes.origin.push(), f"push(delete {file_path})")
+        _push_checked(repo, f"push(delete {file_path})")
         return f"✅ Deleted '{file_path}' from project {_project_tag(project)}"
 
 
