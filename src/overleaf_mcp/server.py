@@ -326,6 +326,15 @@ _TOOLS: list[Tool] = [
                 "file_path": {"type": "string"},
                 "content": {"type": "string", "description": "New full file content"},
                 "commit_message": {"type": "string"},
+                "expected_sha": {
+                    "type": "string",
+                    "description": (
+                        "Optimistic-concurrency guard. Pass the sha shown in "
+                        "read_file's header; the rewrite is refused if the file "
+                        "changed since then, instead of silently discarding "
+                        "whoever edited in between."
+                    ),
+                },
             },
             "required": ["project_id", "file_path", "content"],
         },
@@ -1183,7 +1192,10 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
     if name == "read_file":
         project = get_project(args["project_id"])
         content = await asyncio.to_thread(git_client.read_file, project, args["file_path"])
-        return f"── {args['file_path']} ({len(content)} chars) ──\n\n{content}"
+        return (
+            f"── {args['file_path']} ({len(content)} chars, "
+            f"sha {git_client.content_sha(content)}) ──\n\n{content}"
+        )
 
     if name == "verify_citations":
         ok, why = _verify_mod.verify_available()
@@ -1335,6 +1347,7 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
             args["file_path"],
             args["content"],
             args.get("commit_message"),
+            args.get("expected_sha"),
         )
 
     if name == "update_section":
