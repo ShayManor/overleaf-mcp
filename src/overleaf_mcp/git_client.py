@@ -6,6 +6,7 @@ Overleaf Git bridge (``git.overleaf.com``).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import random
@@ -16,7 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
-from git import GitCommandError, Repo
+from git import GitCommandError, PushInfo, Repo
 
 from .config import (
     DIFF_CONTEXT_LINES,
@@ -51,6 +52,10 @@ _last_pull_at: dict[str, float] = {}
 # Push retry parameters for transient Overleaf git-bridge errors (flaky 5xx).
 _PUSH_RETRIES = max(0, int(os.environ.get("OVERLEAF_PUSH_RETRIES", "2")))
 _PUSH_BACKOFF_BASE = float(os.environ.get("OVERLEAF_PUSH_BACKOFF", "0.75"))
+
+# How many times a write re-derives itself against a moved remote before
+# giving up. See :func:`_write_and_push`.
+_WRITE_ATTEMPTS = max(1, int(os.environ.get("OVERLEAF_WRITE_ATTEMPTS", "3")))
 
 
 def _get_project_lock(project_id: str) -> threading.RLock:
@@ -154,6 +159,16 @@ def _config_git_user(repo: Repo) -> None:
             cw.set_value("user", "name", name)
             cw.set_value("user", "email", email)
 
+    # Always pin a reconcile strategy. Without this, ``git pull`` aborts with
+    # "Need to specify how to reconcile divergent branches" the moment the
+    # Overleaf side gains a commit we do not have, which leaves the clone
+    # permanently diverged and silently serving stale content to readers.
+    try:
+        with repo.config_writer() as cw:
+            cw.set_value("pull", "rebase", "true")
+    except Exception as e:  # pragma: no cover - best effort
+        logger.warning("could not set pull.rebase: %s", e)
+
 
 def validate_path(base: Path, target: str) -> Path:
     """Ensure *target* doesn't escape the repo root.
@@ -199,11 +214,157 @@ def _retry_push(op: Callable[[], T], what: str) -> T:
     raise last_exc
 
 
-def _pull_if_stale(repo: Repo, project_id: str) -> None:
-    """Pull only if we haven't pulled within ``_PULL_TTL`` seconds."""
+class PushRejected(Exception):
+    """The remote refused our refs — normally because Overleaf moved ahead.
+
+    Deliberately NOT a ``GitCommandError`` so :func:`_retry_push` does not
+    burn its backoff budget retrying a rejection that will never succeed on
+    its own. Transient 5xx failures stay retryable; rejections get rebased.
+    """
+
+
+def _push_once(repo: Repo) -> None:
+    """One push attempt that actually reports whether the refs landed.
+
+    ``Remote.push()`` does not raise on rejection: it returns a
+    ``PushInfoList`` whose entries carry ERROR/REJECTED flags, with the
+    exception parked on ``.error``. Reading the flags is the only reliable
+    signal, because the porcelain stderr GitPython surfaces ("failed to push
+    some refs") does not contain the words "non-fast-forward" or "rejected".
+    """
+    infos = repo.remotes.origin.push()
+    error = getattr(infos, "error", None)
+    if error is None:
+        return
+    rejected_mask = PushInfo.REJECTED | PushInfo.REMOTE_REJECTED
+    if any(getattr(i, "flags", 0) & rejected_mask for i in infos):
+        raise PushRejected(str(error))
+    raise error
+
+
+class ContentConflict(Exception):
+    """The file changed underneath a caller who claimed to know its contents."""
+
+
+def content_sha(text: str) -> str:
+    """Short stable digest of file contents, used for optimistic concurrency."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _reset_to_remote(repo: Repo) -> None:
+    """Discard local commits and match origin exactly."""
+    repo.git.fetch("origin")
+    branch = repo.active_branch.name
+    repo.git.reset("--hard", f"origin/{branch}")
+
+
+def _write_and_push(
+    project: ProjectConfig,
+    file_path: str,
+    apply_fn: Callable[[str | None], str],
+    commit_message: str,
+    what: str,
+) -> None:
+    """Apply a content transform, commit, push; re-derive it if the remote moved.
+
+    A search-and-replace never needs a three-way merge. If Overleaf gained a
+    commit while we were working, the push is rejected; instead of rebasing
+    our commit onto content it was not written against, we throw the commit
+    away, take the remote's version of the file, and run the SAME transform
+    over it. Either the anchor is still present, in which case the edit lands
+    cleanly, or it is gone, in which case the caller gets an error naming the
+    anchor rather than a merge conflict. Text conflicts stop being a category
+    of failure a caller has to reason about.
+    """
+    with _with_project_lock(project.project_id):
+        for attempt in range(1, _WRITE_ATTEMPTS + 1):
+            repo = ensure_repo(project, force_pull=True)
+            rp = _repo_path(project.project_id)
+            target = validate_path(rp, file_path)
+            current = target.read_text(encoding="utf-8") if target.exists() else None
+
+            try:
+                new_content = apply_fn(current)
+            except (ValueError, ContentConflict) as e:
+                if attempt == 1:
+                    raise
+                raise type(e)(
+                    f"{e}\n\n(The document changed on Overleaf while this write was in "
+                    f"flight, and the edit no longer applies to the current text. "
+                    f"Re-read '{file_path}' and reissue the edit.)"
+                ) from e
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(new_content, encoding="utf-8")
+
+            _config_git_user(repo)
+            repo.index.add([file_path])
+            repo.index.commit(commit_message)
+
+            try:
+                _retry_push(lambda: _push_once(repo), what)
+                return
+            except PushRejected as e:
+                if attempt == _WRITE_ATTEMPTS:
+                    raise RuntimeError(
+                        f"{what} was rejected {attempt} times running; Overleaf kept "
+                        f"moving under us. Nothing was pushed: {e}"
+                    ) from e
+                logger.warning(
+                    "%s rejected; discarding our commit and re-applying against the "
+                    "updated remote (attempt %d/%d)",
+                    what, attempt, _WRITE_ATTEMPTS,
+                )
+                _reset_to_remote(repo)
+
+
+def _push_checked(repo: Repo, what: str) -> None:
+    """Push and verify it landed, healing the Overleaf-UI race once.
+
+    Without this, a rejected push looked exactly like a successful one: the
+    tool answered "✅", the commit stayed in the local clone, and because the
+    git-side readers read that clone, every later read echoed the caller's
+    own unpushed text back at them.
+    """
+    try:
+        _retry_push(lambda: _push_once(repo), what)
+        return
+    except PushRejected as e:
+        logger.warning("%s rejected (%s); rebasing onto origin and retrying", what, e)
+
+    try:
+        repo.git.pull("--rebase", "origin")
+    except GitCommandError as e:
+        # Never leave the clone parked mid-rebase; a half-finished rebase
+        # breaks every subsequent tool call on this project.
+        try:
+            repo.git.rebase("--abort")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"{what} was rejected and the rebase onto origin failed: {e}. "
+            "Nothing was pushed and the clone was left clean; the project "
+            "needs manual reconciliation."
+        ) from e
+
+    try:
+        _retry_push(lambda: _push_once(repo), f"{what} (after rebase)")
+    except PushRejected as e:
+        raise RuntimeError(
+            f"{what} still rejected after rebasing onto origin: {e}. "
+            "Nothing was pushed."
+        ) from e
+
+
+def _pull_if_stale(repo: Repo, project_id: str, force: bool = False) -> None:
+    """Pull, skipping it if we pulled within ``_PULL_TTL`` seconds.
+
+    ``force`` bypasses the TTL. Writes always force, so an edit is derived
+    from the current remote content rather than a cached snapshot.
+    """
     now = time.monotonic()
     last = _last_pull_at.get(project_id, 0.0)
-    if _PULL_TTL > 0 and (now - last) < _PULL_TTL:
+    if not force and _PULL_TTL > 0 and (now - last) < _PULL_TTL:
         return
     try:
         repo.remotes.origin.pull()
@@ -231,7 +392,7 @@ def _is_valid_repo(rp: Path) -> bool:
         return False
 
 
-def ensure_repo(project: ProjectConfig) -> Repo:
+def ensure_repo(project: ProjectConfig, force_pull: bool = False) -> Repo:
     """Clone or pull the project repo. Thread-safe per project.
 
     The lock is held for the whole lifetime of the returned ``Repo`` use
@@ -261,7 +422,7 @@ def ensure_repo(project: ProjectConfig) -> Repo:
 
         if rp.exists():
             repo = Repo(rp)
-            _pull_if_stale(repo, project.project_id)
+            _pull_if_stale(repo, project.project_id, force=force_pull)
             # Ensure metadata exists (e.g. for repos cloned by older versions)
             try:
                 write_metadata(
@@ -428,7 +589,7 @@ def create_file(
         _config_git_user(repo)
         repo.index.add([file_path])
         repo.index.commit(commit_message or f"Add {file_path}")
-        _retry_push(lambda: repo.remotes.origin.push(), f"push(create {file_path})")
+        _push_checked(repo, f"push(create {file_path})")
         return f"✅ Created '{file_path}' in project {_project_tag(project)}"
 
 
@@ -439,37 +600,37 @@ def edit_file(
     new_string: str,
     commit_message: str | None = None,
 ) -> str:
-    """Surgical search-and-replace edit, commit and push."""
-    with _with_project_lock(project.project_id):
-        repo = ensure_repo(project)
-        rp = _repo_path(project.project_id)
-        target = validate_path(rp, file_path)
+    """Surgical search-and-replace edit, commit and push.
 
-        if not target.exists():
+    The replacement is re-derived against the live remote content if Overleaf
+    moves while the write is in flight, so this never produces a merge
+    conflict: it either applies or reports that the anchor is gone.
+    """
+
+    def apply(content: str | None) -> str:
+        if content is None:
             raise FileNotFoundError(f"File '{file_path}' not found")
-
-        content = target.read_text(encoding="utf-8")
         if old_string not in content:
             preview = content[:500] + ("…" if len(content) > 500 else "")
             raise ValueError(
                 f"old_string not found in '{file_path}'. Preview:\n{preview}"
             )
-
         count = content.count(old_string)
         if count > 1:
             raise ValueError(
                 f"old_string appears {count} times in '{file_path}'. "
                 "Make it more specific to match exactly once."
             )
+        return content.replace(old_string, new_string, 1)
 
-        new_content = content.replace(old_string, new_string, 1)
-        target.write_text(new_content, encoding="utf-8")
-
-        _config_git_user(repo)
-        repo.index.add([file_path])
-        repo.index.commit(commit_message or f"Edit {file_path}")
-        _retry_push(lambda: repo.remotes.origin.push(), f"push(edit {file_path})")
-        return f"✅ Edited '{file_path}' in project {_project_tag(project)}"
+    _write_and_push(
+        project,
+        file_path,
+        apply,
+        commit_message or f"Edit {file_path}",
+        f"push(edit {file_path})",
+    )
+    return f"✅ Edited '{file_path}' in project {_project_tag(project)}"
 
 
 def rewrite_file(
@@ -477,25 +638,46 @@ def rewrite_file(
     file_path: str,
     content: str,
     commit_message: str | None = None,
+    expected_sha: str | None = None,
 ) -> str:
-    """Replace entire file contents, commit and push."""
-    with _with_project_lock(project.project_id):
-        repo = ensure_repo(project)
-        rp = _repo_path(project.project_id)
-        target = validate_path(rp, file_path)
+    """Replace entire file contents, commit and push.
 
-        if not target.exists():
+    A whole-file replacement cannot be re-derived the way an anchored edit
+    can: the caller composed *content* against some specific version of the
+    file, and if the file has moved on, blindly writing it silently discards
+    whoever edited in between. ``expected_sha`` is the optimistic-concurrency
+    guard — pass the digest shown in ``read_file``'s header and the write is
+    refused if the file no longer matches.
+    """
+
+    def apply(current: str | None) -> str:
+        if current is None:
             raise FileNotFoundError(
                 f"File '{file_path}' not found. Use create_file instead."
             )
+        if expected_sha:
+            actual = content_sha(current)
+            if not actual.startswith(expected_sha.strip().lower()[:12]):
+                raise ContentConflict(
+                    f"'{file_path}' has changed since you read it "
+                    f"(expected sha {expected_sha}, found {actual}). "
+                    "Someone edited it in the meantime; re-read the file, "
+                    "rebuild your replacement on top of the current text, and "
+                    "reissue the rewrite. Nothing was written."
+                )
+        return content
 
-        target.write_text(content, encoding="utf-8")
-
-        _config_git_user(repo)
-        repo.index.add([file_path])
-        repo.index.commit(commit_message or f"Rewrite {file_path}")
-        _retry_push(lambda: repo.remotes.origin.push(), f"push(rewrite {file_path})")
-        return f"✅ Rewrote '{file_path}' in project {_project_tag(project)}"
+    _write_and_push(
+        project,
+        file_path,
+        apply,
+        commit_message or f"Rewrite {file_path}",
+        f"push(rewrite {file_path})",
+    )
+    return (
+        f"✅ Rewrote '{file_path}' in project {_project_tag(project)} "
+        f"(sha {content_sha(content)})"
+    )
 
 
 def upload_file(
@@ -547,7 +729,7 @@ def upload_file(
         _config_git_user(repo)
         repo.index.add([file_path])
         repo.index.commit(commit_message or f"Upload {file_path}")
-        _retry_push(lambda: repo.remotes.origin.push(), f"push(upload {file_path})")
+        _push_checked(repo, f"push(upload {file_path})")
         size_kb = len(data) / 1024
         verb = "Replaced" if existed else "Uploaded"
         return (
@@ -574,7 +756,7 @@ def delete_file(
         repo.index.remove([file_path])
         target.unlink()
         repo.index.commit(commit_message or f"Delete {file_path}")
-        _retry_push(lambda: repo.remotes.origin.push(), f"push(delete {file_path})")
+        _push_checked(repo, f"push(delete {file_path})")
         return f"✅ Deleted '{file_path}' from project {_project_tag(project)}"
 
 
