@@ -59,6 +59,7 @@ compile = [
 
 [project.scripts]
 overleaf-mcp = "overleaf_mcp.server:main"
+overleaf-mcp-proxy = "overleaf_mcp.proxy:main"
 
 [build-system]
 requires = ["hatchling"]

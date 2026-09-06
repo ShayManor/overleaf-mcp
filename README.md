@@ -213,6 +213,47 @@ You can start with just the cookie and add the git token later.
 
 (For Claude Desktop / Claude Code see the setup section above.)
 
+### Server on another machine (ssh)
+
+If `overleaf-mcp` runs on a different host, `upload_file` reads `source_path`
+on that host, so a path on your laptop fails. Put `overleaf-mcp-proxy` in
+front of the ssh command instead. It pipes the MCP stream through untouched
+and, for an `upload_file` whose `source_path` exists locally, streams the
+file to the host first and rewrites the path. It holds no credentials.
+
+```json
+{
+  "mcpServers": {
+    "overleaf": {
+      "command": "overleaf-mcp-proxy",
+      "args": [
+        "--host", "minipc",
+        "--",
+        "set -a; . ~/.config/overleaf-mcp/env; set +a; exec ~/src/overleaf-mcp/.venv/bin/overleaf-mcp"
+      ]
+    }
+  }
+}
+```
+
+Everything after `--` is the command that starts the server on the host.
+In-flight files go to `~/.cache/overleaf-mcp/inbox/<id>/` on the host, and the
+proxy removes them once the server answers. `--inbox DIR` changes the location.
+Each upload opens two ssh connections (copy, cleanup), so `ControlMaster`
+in `~/.ssh/config` makes them near-instant. Downloads (`download_pdf`,
+`download_source`) still write on the host.
+
+ssh must authenticate without prompting. A passphrase prompt or an
+unaccepted host key leaves the proxy stalled with no visible error, so use
+a key loaded in an agent and connect once by hand first to accept the host
+key.
+
+The remote shell must print nothing on stdout: anything a remote startup
+file prints lands in the JSON-RPC stream and breaks every tool.
+
+Install the package on the laptop as well as the host, since the proxy
+runs locally.
+
 ---
 
 ## 🛠️ Tools Reference
@@ -223,6 +264,7 @@ You can start with just the cookie and add the git token later.
 |---|---|
 | `create_file` | Create a new file (auto-creates folders), commit & push |
 | `create_project` | Create a new blank Overleaf project (requires session cookie) |
+| `upload_file` | Upload a local file as raw bytes (images, PDFs, fonts), commit & push. `overwrite=true` replaces an existing file |
 
 ### Read
 
@@ -328,6 +370,7 @@ You can start with just the cookie and add the git token later.
 - `git_client.py` — Git operations (clone, pull, push, diff, history)
 - `latex.py` — LaTeX document structure parsing
 - `compile.py` — PDF compilation and download (uses session cookie)
+- `proxy.py` (`overleaf-mcp-proxy`): stdio shim for a server on another host; copies `upload_file` sources across ssh
 - `server.py` — MCP server with 18 tool definitions
 
 ---

@@ -23,3 +23,5 @@ mobkatt78pofq9-demo.png
 # Working spec, not shipped
 spec.md
 .idea/
+# Working plans/specs, never shipped
+docs/superpowers/
